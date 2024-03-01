@@ -148,6 +148,115 @@ def rand_poses(size, device, opt, radius_range=[1, 1.5], theta_range=[0, 120], p
 
     return poses, dirs, thetas, phis, radius
 
+def rand_4poses(size, device, opt, radius_range=[1, 1.5], theta_range=[0, 120], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=60, uniform_sphere_rate=0.5):
+    ''' generate random poses from an orbit camera
+    Args:
+        size: batch size of generated poses.
+        device: where to allocate the output.
+        radius: camera radius
+        theta_range: [min, max], should be in [0, pi]
+        phi_range: [min, max], should be in [0, 2 * pi]
+    Return:
+        poses: [size, 4, 4]
+    '''
+    theta_range = np.array(theta_range) / 180 * np.pi
+    phi_range = np.array(phi_range) / 180 * np.pi
+    angle_overhead = angle_overhead / 180 * np.pi
+    angle_front = angle_front / 180 * np.pi
+
+    radius = torch.rand(size, device=device) * (radius_range[1] - radius_range[0]) + radius_range[0]
+    delta = np.pi / 180 * 1
+
+    if random.random() < uniform_sphere_rate:
+        unit_centers = F.normalize(
+            torch.stack([
+                torch.randn(size, device=device),
+                torch.abs(torch.randn(size, device=device)),
+                torch.randn(size, device=device),
+            ], dim=-1), p=2, dim=1
+        )
+        thetas = torch.acos(unit_centers[:,1])
+        phis = torch.atan2(unit_centers[:,0], unit_centers[:,2])
+        phis[phis < 0] += 2 * np.pi
+        centers = unit_centers * radius.unsqueeze(-1)
+    else:
+        thetas = torch.rand(size, device=device) * (theta_range[1] - theta_range[0]) + theta_range[0]
+        phis = torch.rand(size, device=device) * (phi_range[1] - phi_range[0]) + phi_range[0]
+        phis[phis < 0] += 2 * np.pi
+
+        centers = torch.stack([
+            radius * torch.sin(thetas) * torch.sin(phis),
+            radius * torch.cos(thetas),
+            radius * torch.sin(thetas) * torch.cos(phis),
+        ], dim=-1) # [B, 3]
+    
+    thetas = thetas.unsqueeze(1)
+    phis = phis.unsqueeze(1)
+    centers = centers.unsqueeze(1) # [B, 1, 3]
+
+    # extract 3 additional centers that are linearly aligned
+    for i in range(1, 4):
+        new_thetas = thetas[:, 0]
+        new_phis = phis[:, 0] + i * delta
+        
+        new_centers = torch.stack([
+            radius * torch.sin(new_thetas) * torch.sin(new_phis),
+            radius * torch.cos(new_thetas),
+            radius * torch.sin(new_thetas) * torch.cos(new_phis),
+        ], dim=-1) # [B, 3]
+        
+        thetas = torch.cat((thetas, new_thetas.unsqueeze(1)), dim=1)
+        phis = torch.cat((phis, new_phis.unsqueeze(1)), dim=1)
+        centers = torch.cat((centers, new_centers.unsqueeze(1)), dim=1)
+
+    # [B, 4, ~]에서 [4, B, ~]로 전치
+    thetas = thetas.transpose(0, 1)  # [4, B]
+    phis = phis.transpose(0, 1)  # [4, B]
+    centers = centers.transpose(0, 1)  # [4, B, 3]
+
+    # [4, B, ~]에서 [4*B, ~]로 변경
+    thetas = thetas.contiguous().view(-1)  # [4*B]
+    phis = phis.contiguous().view(-1)  # [4*B]
+    centers = centers.contiguous().view(-1, 3)  # [4*B, 3]
+
+    size *= 4
+
+    targets = 0
+
+    # jitters
+    if opt.jitter_pose:
+        jit_center = opt.jitter_center # 0.015  # was 0.2
+        jit_target = opt.jitter_target
+        centers += torch.rand_like(centers) * jit_center - jit_center/2.0
+        targets += torch.randn_like(centers) * jit_target
+
+    # lookat
+    forward_vector = safe_normalize(centers - targets)
+    up_vector = torch.FloatTensor([0, 1, 0]).to(device).unsqueeze(0).repeat(size, 1)
+    right_vector = safe_normalize(torch.cross(forward_vector, up_vector, dim=-1))
+
+    if opt.jitter_pose:
+        up_noise = torch.randn_like(up_vector) * opt.jitter_up
+    else:
+        up_noise = 0
+
+    up_vector = safe_normalize(torch.cross(right_vector, forward_vector, dim=-1) + up_noise)
+
+    poses = torch.eye(4, dtype=torch.float, device=device).unsqueeze(0).repeat(size, 1, 1)
+    poses[:, :3, :3] = torch.stack((right_vector, up_vector, forward_vector), dim=-1)
+    poses[:, :3, 3] = centers
+
+    if return_dirs:
+        dirs = get_view_direction(thetas, phis, angle_overhead, angle_front)
+    else:
+        dirs = None
+
+    # back to degree
+    thetas = thetas / np.pi * 180
+    phis = phis / np.pi * 180
+
+    return poses, dirs, thetas, phis, radius
+
 
 def circle_poses(device, radius=torch.tensor([3.2]), theta=torch.tensor([60]), phi=torch.tensor([0]), return_dirs=False, angle_overhead=30, angle_front=60):
 
@@ -251,8 +360,9 @@ class NeRFDataset:
 
         if self.training:
             # random pose on the fly
-            poses, dirs, thetas, phis, radius = rand_poses(B, self.device, self.opt, radius_range=self.opt.radius_range, theta_range=self.opt.theta_range, phi_range=self.opt.phi_range, return_dirs=True, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, uniform_sphere_rate=self.opt.uniform_sphere_rate)
-
+            # poses, dirs, thetas, phis, radius = rand_poses(B, self.device, self.opt, radius_range=self.opt.radius_range, theta_range=self.opt.theta_range, phi_range=self.opt.phi_range, return_dirs=True, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, uniform_sphere_rate=self.opt.uniform_sphere_rate)
+            poses, dirs, thetas, phis, radius = rand_4poses(B, self.device, self.opt, radius_range=self.opt.radius_range, theta_range=self.opt.theta_range, phi_range=self.opt.phi_range, return_dirs=True, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, uniform_sphere_rate=self.opt.uniform_sphere_rate)
+            
             # random focal
             fov = random.random() * (self.opt.fovy_range[1] - self.opt.fovy_range[0]) + self.opt.fovy_range[0]
 

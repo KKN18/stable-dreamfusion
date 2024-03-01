@@ -36,7 +36,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--IF', action='store_true', help="experimental: use DeepFloyd IF as the guidance model for nerf stage")
 
-    parser.add_argument('--guidance', type=str, nargs='*', default=['SD'], help='guidance model')
+    parser.add_argument('--guidance', type=str, nargs='*', default=['SVD'], help='guidance model')
     parser.add_argument('--guidance_scale', type=float, default=100, help="diffusion model classifier-free guidance scale")
 
     parser.add_argument('--save_mesh', action='store_true', help="export an obj mesh with texture")
@@ -376,6 +376,10 @@ if __name__ == '__main__':
             # scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         guidance = nn.ModuleDict()
+
+        if 'SVD' in opt.guidance:
+            from guidance.svd_utils import StableVideoDiffusion
+            guidance['SVD'] = StableVideoDiffusion(device, opt.t_range)
 
         if 'SD' in opt.guidance:
             from guidance.sd_utils import StableDiffusion

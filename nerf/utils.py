@@ -253,6 +253,8 @@ class Trainer(object):
         # guide model
         self.guidance = guidance
         self.embeddings = {}
+        self.clip_embeddings = {}
+        self.vae_latents = {}
 
         # text prompt / images
         if self.guidance is not None:
@@ -355,6 +357,49 @@ class Trainer(object):
         # text embeddings (stable-diffusion)
         if self.opt.text is not None:
 
+            if 'SVD' in self.guidance:
+                self.embeddings['SVD']['default'] = self.guidance['SVD'].get_text_embeds([self.opt.text])
+                self.embeddings['SVD']['uncond'] = self.guidance['SVD'].get_text_embeds([self.opt.negative])
+
+                for d in ['front', 'side', 'back']:
+                    self.embeddings['SVD'][d] = self.guidance['SVD'].get_text_embeds([f"{self.opt.text}, {d} view"])
+
+                base_folder_path = "nerf/data"
+                if not os.path.exists(base_folder_path):
+                    os.makedirs(base_folder_path)
+                    for d in ['default', 'front', 'side', 'back']:
+                        print(f"Processing {d} view input image")
+                        pos_embedding = self.embeddings['SVD'][d]
+                        neg_embedding = self.embeddings['SVD']['uncond']
+                        
+                        clip_embedding, vae_latent = self.guidance['SVD'].get_image_latent(d, pos_embedding, neg_embedding)
+                        
+                        clip_folder_path = f"{base_folder_path}/clip"
+                        if not os.path.exists(clip_folder_path):
+                            os.makedirs(clip_folder_path)
+                        torch.save(clip_embedding, f"{clip_folder_path}/{d}_embedding.pt")
+                        
+                        vae_folder_path = f"{base_folder_path}/vae"
+                        if not os.path.exists(vae_folder_path):
+                            os.makedirs(vae_folder_path)
+                        torch.save(vae_latent, f"{vae_folder_path}/{d}_latent.pt")
+
+                        self.clip_embeddings[d] = clip_embedding
+                        self.vae_latents[d] = vae_latent
+                        
+                else:
+                    for d in ['default', 'front', 'side', 'back']:
+                        clip_folder_path = f"{base_folder_path}/clip"
+                        clip_embedding = torch.load(f"{clip_folder_path}/{d}_embedding.pt")
+                        
+                        vae_folder_path = f"{base_folder_path}/vae"
+                        vae_latent = torch.load(f"{vae_folder_path}/{d}_latent.pt")
+                        
+                        self.clip_embeddings[d] = clip_embedding
+                        self.vae_latents[d] = vae_latent
+                        
+                print("Done")
+
             if 'SD' in self.guidance:
                 self.embeddings['SD']['default'] = self.guidance['SD'].get_text_embeds([self.opt.text])
                 self.embeddings['SD']['uncond'] = self.guidance['SD'].get_text_embeds([self.opt.negative])
@@ -436,6 +481,18 @@ class Trainer(object):
 
     ### ------------------------------
 
+    def determine_view(self, azimuth):
+        # 'front' view for azimuth between -60 and 60 degrees
+        if -60 <= azimuth <= 60:
+            view = 'front'
+        # 'side' view for azimuth between 60 and 120 degrees or -60 and -120 degrees
+        elif 60 < azimuth <= 120 or -120 <= azimuth < -60:
+            view = 'side'
+        # 'back' view for azimuth between 120 and 180 degrees or -120 and -180 degrees
+        else:
+            view = 'back'
+        return view
+
     def train_step(self, data, save_guidance_path:Path=None):
         """
             Args:
@@ -479,13 +536,13 @@ class Trainer(object):
         H, W = data['H'], data['W']
 
         # When ref_data has B images > opt.batch_size
-        if B > self.opt.batch_size:
-            # choose batch_size images out of those B images
-            choice = torch.randperm(B)[:self.opt.batch_size]
-            B = self.opt.batch_size
-            rays_o = rays_o[choice]
-            rays_d = rays_d[choice]
-            mvp = mvp[choice]
+        # if B > self.opt.batch_size:
+        #     # choose batch_size images out of those B images
+        #     choice = torch.randperm(B)[:self.opt.batch_size]
+        #     B = self.opt.batch_size
+        #     rays_o = rays_o[choice]
+        #     rays_d = rays_d[choice]
+        #     mvp = mvp[choice]
 
         if do_rgbd_loss:
             ambient_ratio = 1.0
@@ -553,11 +610,11 @@ class Trainer(object):
             gt_normal = self.normal # [B, H, W, 3]
             gt_depth = self.depth   # [B, H, W]
 
-            if len(gt_rgb) > self.opt.batch_size:
-                gt_mask = gt_mask[choice]
-                gt_rgb = gt_rgb[choice]
-                gt_normal = gt_normal[choice]
-                gt_depth = gt_depth[choice]
+            # if len(gt_rgb) > self.opt.batch_size:
+            #     gt_mask = gt_mask[choice]
+            #     gt_rgb = gt_rgb[choice]
+            #     gt_normal = gt_normal[choice]
+            #     gt_depth = gt_depth[choice]
 
             # color loss
             gt_rgb = gt_rgb * gt_mask[:, None].float() + bg_color.reshape(B, H, W, 3).permute(0,3,1,2).contiguous() * (1 - gt_mask[:, None].float())
@@ -593,6 +650,37 @@ class Trainer(object):
         else:
 
             loss = 0
+
+            if 'SVD' in self.guidance:
+                azimuth = data['azimuth']
+                print(f"\n[DEBUG] azimuth: {azimuth}")
+                
+                azimuth = azimuth[0]
+                
+                if azimuth >= -90 and azimuth < 90:
+                    if azimuth >= 0:
+                        r = 1 - azimuth / 90
+                    else:
+                        r = 1 + azimuth / 90
+                    start_c = self.clip_embeddings['front']
+                    end_c = self.clip_embeddings['side']
+                else:
+                    if azimuth >= 0:
+                        r = 1 - (azimuth - 90) / 90
+                    else:
+                        r = 1 + (azimuth + 90) / 90
+                    start_c = self.clip_embeddings['side']
+                    end_c = self.clip_embeddings['back']
+                
+                clip_embedding = r * start_c + (1 - r) * end_c
+                
+                view = self.determine_view(azimuth)
+                print(f"[DEBUG] view: {view}")
+                view = "front"
+                vae_latent = self.vae_latents[view]
+                
+                loss = loss + self.guidance['SVD'].train_step(pred_rgb, clip_embedding, vae_latent, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance, save_guidance_path=save_guidance_path)
+                
 
             if 'SD' in self.guidance:
                 # interpolate text_z
